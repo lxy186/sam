@@ -4,6 +4,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+import warnings
+import albumentations as A
+
+# 在文件开头添加以下代码来忽略特定警告
+warnings.filterwarnings("ignore", message="Error fetching version info")
 
 class BUSIDataset(Dataset):
     def __init__(self, data_root, transform=None, split='train'):
@@ -84,7 +89,6 @@ class BUSIDataset(Dataset):
 
 def build_data_loader(data_root, batch_size=4, num_workers=4):
     """构建数据加载器"""
-    import albumentations as A
     from albumentations.pytorch import ToTensorV2
 
     transform = A.Compose([

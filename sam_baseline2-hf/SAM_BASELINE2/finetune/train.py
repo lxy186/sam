@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 import argparse
 import numpy as np
 import torch
@@ -9,14 +10,23 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import logging
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
-# 添加父目录到Python路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# 获取当前文件的绝对路径
+current_file = Path(__file__).resolve()
+# 获取项目根目录（sam_baseline2）
+project_root = current_file.parent.parent.parent
+# 将项目根目录添加到Python路径
+sys.path.insert(0, str(project_root))
 
 # 现在可以导入segment_anything
 from segment_anything.build_sam import sam_model_registry
-from dataset import build_data_loader
-from utils import calculate_dice, compute_hd95 as calculate_hausdorff, calculate_specificity
+from SAM_BASELINE2.finetune.dataset import build_data_loader
+from SAM_BASELINE2.finetune.utils import calculate_dice, compute_hd95 as calculate_hausdorff, calculate_specificity
+from SAM_BASELINE2.modules.hf_module import add_hf_module
+
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SAM 微调', add_help=False)
@@ -30,8 +40,13 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--model_type', default='vit_l', type=str)
+    parser.add_argument('--model_type', type=str, required=True,
+                      choices=['vit_h', 'vit_l', 'vit_b', 'sam_hf'],
+                      help='选择模型类型: vit_h, vit_l, vit_b, 或 sam_hf')
     parser.add_argument('--validate', action='store_true', help='是否在训练后进行验证')
+    parser.add_argument('--use_hf', action='store_true', help='是否使用高频特征增强模块')
+    parser.add_argument('--hf_layers', nargs='+', type=int, default=[3,7,11], 
+                      help='添加HF模块的层索引')
     
     return parser
 
@@ -68,6 +83,13 @@ def main(args):
     # 加载模型
     logger.info(f"加载 SAM 模型 {args.model_type}...")
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
+    
+    # 添加HF模块
+    if args.use_hf:
+        logger.info("添加高频特征增强模块...")
+        sam = add_hf_module(sam, layers=args.hf_layers)
+        logger.info(f"在层 {args.hf_layers} 添加了HF模块")
+    
     sam.to(device)
     
     # 冻结图像编码器
@@ -137,7 +159,7 @@ def main(args):
             
             # 逐图像处理
             for i in range(batch_size):
-                with torch.cuda.amp.autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     # 处理单张图像
                     image = images[i:i+1]  # 保持批次维度
                     mask = masks[i:i+1]    # 保持批次维度

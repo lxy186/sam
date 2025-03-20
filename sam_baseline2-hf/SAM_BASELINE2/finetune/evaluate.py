@@ -6,25 +6,37 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from PIL import Image
+import warnings
+from typing import Dict, Any
+from torch.cuda.amp import autocast
 
 # 添加父目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from segment_anything.build_sam import sam_model_registry
-from dataset import build_data_loader
-from utils import evaluate_model
+from SAM_BASELINE2.finetune.dataset import build_data_loader
+from SAM_BASELINE2.finetune.utils import evaluate_model
+
+# 忽略特定警告
+warnings.filterwarnings("ignore", message="Error fetching version info")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SAM 评估', add_help=False)
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--data_path', default='./Dataset_BUSI_with_GT', type=str)
     parser.add_argument('--checkpoint', default='./output/best_model.pth', type=str)
-    parser.add_argument('--model_type', default='vit_b', type=str)
+    parser.add_argument('--model_type', type=str, required=True,
+                      choices=['vit_h', 'vit_l', 'vit_b'],
+                      help='选择模型类型: vit_h, vit_l, 或 vit_b')
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--output_dir', default='./evaluation', type=str)
     parser.add_argument('--visualize', action='store_true', help='是否可视化结果')
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--num_samples', default=10, type=int, help='可视化样本数量')
+    parser.add_argument('--use_hf', action='store_true', help='是否使用高频特征增强模块')
+    parser.add_argument('--hf_layers', nargs='+', type=int, default=[3,7,11],
+                      help='添加HF模块的层索引')
     
     return parser
 
@@ -139,6 +151,12 @@ def main(args):
     # 加载模型
     print(f"加载 SAM 模型 {args.model_type}...")
     sam = sam_model_registry[args.model_type]()
+    
+    if args.use_hf:
+        print("添加高频特征增强模块...")
+        from modules.hf_module import add_hf_module
+        sam = add_hf_module(sam, layers=args.hf_layers)
+    
     sam.to(device)
     
     # 加载最佳模型
