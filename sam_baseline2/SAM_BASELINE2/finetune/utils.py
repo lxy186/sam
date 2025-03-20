@@ -4,6 +4,7 @@ import torch.nn.functional as F
 # from medpy.metric.binary import hd95 as compute_hd95
 import scipy.ndimage as ndimage
 from scipy.spatial.distance import directed_hausdorff
+from tqdm import tqdm
 
 def calculate_dice(pred, target):
     """计算Dice系数"""
@@ -75,51 +76,82 @@ def evaluate_model(model, data_loader, device):
     total_dice = 0.0
     total_hd95 = 0.0
     total_spec = 0.0
+    total_samples = 0
     
     with torch.no_grad():
-        for batch in data_loader:
+        for batch in tqdm(data_loader, desc="评估"):
             images = batch['image'].to(device)
             masks = batch['mask'].float().to(device)
+            batch_size = images.shape[0]
             
-            # 获取图像嵌入
-            image_embeddings = model.image_encoder(images)
+            batch_dice = 0.0
+            batch_hd95 = 0.0
+            batch_spec = 0.0
             
-            # 生成提示 (使用图像中心点)
-            batch_size, _, h, w = images.shape
-            points = torch.tensor([[[w//2, h//2]]] * batch_size, device=device).float()
-            point_labels = torch.ones(batch_size, 1, device=device)
+            # 逐个处理图像
+            for i in range(batch_size):
+                # 处理单张图像
+                image = images[i:i+1]
+                mask = masks[i:i+1]
+                
+                # 添加图像预处理步骤
+                image = model.preprocess(image)
+                
+                # 获取图像嵌入
+                image_embedding = model.image_encoder(image)
+                
+                # 生成提示点 (使用图像中心点)
+                h, w = image.shape[-2:]
+                point = torch.tensor([[[w//2, h//2]]], device=device)
+                point_label = torch.ones(1, 1, device=device)
+                
+                # 生成掩膜预测
+                sparse_embedding, dense_embedding = model.prompt_encoder(
+                    points=(point, point_label),
+                    boxes=None,
+                    masks=None,
+                )
+                
+                mask_prediction, _ = model.mask_decoder(
+                    image_embeddings=image_embedding,
+                    image_pe=model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embedding,
+                    dense_prompt_embeddings=dense_embedding,
+                    multimask_output=False,
+                )
+                
+                # 将预测掩码上采样到原始图像尺寸
+                mask_prediction = model.postprocess_masks(
+                    mask_prediction,
+                    input_size=image.shape[-2:],
+                    original_size=image.shape[-2:]
+                )
+                
+                # 计算评估指标
+                pred_mask = (torch.sigmoid(mask_prediction) > 0.5).float()
+                curr_dice = calculate_dice(pred_mask, mask.unsqueeze(1)).item()
+                
+                # 计算HD95和特异性
+                pred_np = pred_mask.squeeze().cpu().numpy()
+                mask_np = mask.squeeze().cpu().numpy()
+                curr_hd95 = compute_hd95(pred_np, mask_np)
+                curr_spec = calculate_specificity(pred_np, mask_np)
+                
+                # 累加指标
+                batch_dice += curr_dice
+                batch_hd95 += curr_hd95
+                batch_spec += curr_spec
             
-            # 生成掩膜预测
-            sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                points=points,
-                boxes=None,
-                masks=None,
-            )
-            
-            mask_predictions, _ = model.mask_decoder(
-                image_embeddings=image_embeddings,
-                image_pe=model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
-            )
-            
-            # 计算评估指标
-            pred_masks = (torch.sigmoid(mask_predictions) > 0.5).float()
-            total_dice += calculate_dice(pred_masks, masks.unsqueeze(1)).item() * images.size(0)
-            
-            # 转为 CPU numpy 计算 HD95 和 Spec
-            pred_np = pred_masks.squeeze(1).cpu().numpy()
-            masks_np = masks.cpu().numpy()
-            
-            for i in range(len(pred_np)):
-                total_hd95 += compute_hd95(pred_np[i], masks_np[i])
-                total_spec += calculate_specificity(pred_np[i], masks_np[i])
+            # 累加批次指标
+            total_dice += batch_dice
+            total_hd95 += batch_hd95
+            total_spec += batch_spec
+            total_samples += batch_size
     
     # 计算平均指标
-    avg_dice = total_dice / len(data_loader.dataset)
-    avg_hd95 = total_hd95 / len(data_loader.dataset)
-    avg_spec = total_spec / len(data_loader.dataset)
+    avg_dice = total_dice / total_samples
+    avg_hd95 = total_hd95 / total_samples
+    avg_spec = total_spec / total_samples
     
     return {
         'dice': avg_dice,

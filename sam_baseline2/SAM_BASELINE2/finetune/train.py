@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 import argparse
 import numpy as np
 import torch
@@ -9,14 +10,23 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import logging
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
-# 添加父目录到Python路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# 获取当前文件的绝对路径
+current_file = Path(__file__).resolve()
+# 获取项目根目录（sam_baseline2）
+project_root = current_file.parent.parent.parent
+# 将项目根目录添加到Python路径
+sys.path.insert(0, str(project_root))
 
 # 现在可以导入segment_anything
 from segment_anything.build_sam import sam_model_registry
-from dataset import build_data_loader
-from utils import calculate_dice, compute_hd95 as calculate_hausdorff, calculate_specificity
+from SAM_BASELINE2.finetune.dataset import build_data_loader
+from SAM_BASELINE2.finetune.utils import calculate_dice, compute_hd95 as calculate_hausdorff, calculate_specificity
+from SAM_BASELINE2.modules.hf_module import add_hf_module
+
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SAM 微调', add_help=False)
@@ -25,12 +35,18 @@ def get_args_parser():
     parser.add_argument('--lr', type=float, default=1e-5, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--data_path', default='./Dataset_BUSI_with_GT', type=str)
-    parser.add_argument('--checkpoint', default='./checkpoint/sam_vit_h_4b8939.pth', type=str)
+    parser.add_argument('--checkpoint', default='./checkpoint/sam_vit_l_0b3195.pth', type=str)
     parser.add_argument('--output_dir', default='./output', type=str)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--model_type', default='vit_h', type=str)
+    parser.add_argument('--model_type', type=str, required=True,
+                      choices=['vit_h', 'vit_l', 'vit_b', 'sam_hf'],
+                      help='选择模型类型: vit_h, vit_l, vit_b, 或 sam_hf')
+    parser.add_argument('--validate', action='store_true', help='是否在训练后进行验证')
+    parser.add_argument('--use_hf', action='store_true', help='是否使用高频特征增强模块')
+    parser.add_argument('--hf_layers', nargs='+', type=int, default=[3,7,11], 
+                      help='添加HF模块的层索引')
     
     return parser
 
@@ -67,6 +83,13 @@ def main(args):
     # 加载模型
     logger.info(f"加载 SAM 模型 {args.model_type}...")
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
+    
+    # 添加HF模块
+    if args.use_hf:
+        logger.info("添加高频特征增强模块...")
+        sam = add_hf_module(sam, layers=args.hf_layers)
+        logger.info(f"在层 {args.hf_layers} 添加了HF模块")
+    
     sam.to(device)
     
     # 冻结图像编码器
@@ -136,10 +159,13 @@ def main(args):
             
             # 逐图像处理
             for i in range(batch_size):
-                with torch.cuda.amp.autocast(enabled=True):
+                with autocast('cuda', enabled=True):
                     # 处理单张图像
                     image = images[i:i+1]  # 保持批次维度
                     mask = masks[i:i+1]    # 保持批次维度
+                    
+                    # 使用SAM的预处理方法
+                    image = sam.preprocess(image)
                     
                     # 获取图像特征
                     image_embedding = sam.image_encoder(image)
@@ -217,16 +243,18 @@ def main(args):
         # 在终端打印摘要
         print_metrics(epoch+1, args.epochs, "Training", train_loss, train_dice, 
                      lr=optimizer.param_groups[0]['lr'])
-        
-        # 验证
+    
+    if args.validate:
+        # 训练完成后进行验证
+        logger.info("开始验证...")
         sam.eval()
         val_loss = 0.0
         val_dice = 0.0
         val_hd95 = 0.0
         val_spec = 0.0
-        
+
         with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} Validation")
+            val_bar = tqdm(val_loader, desc="Validation")
             for batch in val_bar:
                 images = batch['image'].to(device)
                 masks = batch['mask'].to(device)
@@ -242,6 +270,9 @@ def main(args):
                     # 处理单张图像
                     image = images[i:i+1]
                     mask = masks[i:i+1].float()
+                    
+                    # 使用SAM的预处理方法
+                    image = sam.preprocess(image)
                     
                     # 获取图像特征
                     image_embedding = sam.image_encoder(image)
@@ -306,28 +337,28 @@ def main(args):
                     'loss': f"{batch_loss/batch_size:.4f}", 
                     'dice': f"{batch_dice/batch_size:.4f}"
                 })
-        
+
         # 计算平均指标
         val_loss /= len(val_loader)
         val_dice /= len(val_loader)
         val_hd95 /= len(val_loader.dataset)
         val_spec /= len(val_loader.dataset)
-        
+
         # 记录验证指标
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Dice/val', val_dice, epoch)
-        writer.add_scalar('HD95/val', val_hd95, epoch)
-        writer.add_scalar('Specificity/val', val_spec, epoch)
-        
+        writer.add_scalar('Loss/val', val_loss, args.epochs-1)
+        writer.add_scalar('Dice/val', val_dice, args.epochs-1)
+        writer.add_scalar('HD95/val', val_hd95, args.epochs-1)
+        writer.add_scalar('Specificity/val', val_spec, args.epochs-1)
+
         # 在终端打印验证摘要
-        print_metrics(epoch+1, args.epochs, "Validation", val_loss, val_dice, 
+        print_metrics(args.epochs, args.epochs, "Validation", val_loss, val_dice, 
                      hd95=val_hd95, spec=val_spec)
-        
+
         # 保存最佳模型
         if val_dice > best_val_dice:
             best_val_dice = val_dice
             torch.save({
-                'epoch': epoch,
+                'epoch': args.epochs-1,
                 'model_state_dict': sam.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_dice': val_dice,
@@ -336,99 +367,94 @@ def main(args):
             }, os.path.join(args.output_dir, 'best_model.pth'))
             print(f"\n保存最佳模型 -> 验证 Dice: {val_dice:.4f}, HD95: {val_hd95:.4f}, Spec: {val_spec:.4f}\n")
         
-        # 每个 epoch 保存一次检查点
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': sam.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_dice': val_dice,
-        }, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
-    
-    # 测试最佳模型
-    logger.info("加载最佳模型进行测试...")
-    checkpoint = torch.load(os.path.join(args.output_dir, 'best_model.pth'))
-    sam.load_state_dict(checkpoint['model_state_dict'])
-    
-    sam.eval()
-    test_dice = 0.0
-    test_hd95 = 0.0
-    test_spec = 0.0
-    test_samples = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing"):
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
-            batch_size = images.shape[0]
-            
-            batch_dice = 0
-            batch_hd95 = 0
-            batch_spec = 0
-            
-            # 逐图像处理测试集
-            for i in range(batch_size):
-                # 处理单张图像
-                image = images[i:i+1]
-                mask = masks[i:i+1].float()
-                
-                # 获取图像特征
-                image_embedding = sam.image_encoder(image)
-                
-                # 生成提示点
-                h, w = image.shape[-2:]
-                point = torch.tensor([[[w//2, h//2]]], device=device)
-                point_label = torch.ones(1, 1, device=device)
-                
-                # 生成掩膜预测
-                sparse_embedding, dense_embedding = sam.prompt_encoder(
-                    points=(point, point_label),
-                    boxes=None,
-                    masks=None,
-                )
-                
-                # 预测掩膜
-                mask_prediction, _ = sam.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=sam.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embedding,
-                    dense_prompt_embeddings=dense_embedding,
-                    multimask_output=False,
-                )
-                
-                # 将预测掩码上采样到原始图像尺寸
-                mask_prediction = sam.postprocess_masks(
-                    mask_prediction,
-                    input_size=image.shape[-2:],
-                    original_size=image.shape[-2:]
-                )
-                
-                # 计算评估指标
-                pred_mask = (torch.sigmoid(mask_prediction) > 0.5).float()
-                curr_dice = calculate_dice(pred_mask, mask.unsqueeze(1)).item()
-                
-                # 计算HD95和特异性
-                pred_np = pred_mask.squeeze().cpu().numpy()
-                mask_np = mask.squeeze().cpu().numpy()
-                curr_hd95 = calculate_hausdorff(pred_np, mask_np)
-                curr_spec = calculate_specificity(pred_np, mask_np)
-                
-                # 累加指标
-                batch_dice += curr_dice
-                batch_hd95 += curr_hd95
-                batch_spec += curr_spec
-            
-            # 累加批次指标
-            test_dice += batch_dice
-            test_hd95 += batch_hd95
-            test_spec += batch_spec
-            test_samples += batch_size
+        # 测试最佳模型
+        logger.info("加载最佳模型进行测试...")
+        checkpoint = torch.load(os.path.join(args.output_dir, 'best_model.pth'))
+        sam.load_state_dict(checkpoint['model_state_dict'])
         
-        # 计算平均指标
-        test_dice /= test_samples
-        test_hd95 /= test_samples
-        test_spec /= test_samples
-    
-    logger.info(f"测试结果 - Dice: {test_dice:.4f}, HD95: {test_hd95:.4f}, Spec: {test_spec:.4f}")
+        sam.eval()
+        test_dice = 0.0
+        test_hd95 = 0.0
+        test_spec = 0.0
+        test_samples = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Testing"):
+                images = batch['image'].to(device)
+                masks = batch['mask'].to(device)
+                batch_size = images.shape[0]
+                
+                batch_dice = 0
+                batch_hd95 = 0
+                batch_spec = 0
+                
+                # 逐图像处理测试集
+                for i in range(batch_size):
+                    # 处理单张图像
+                    image = images[i:i+1]
+                    mask = masks[i:i+1].float()
+                    
+                    # 使用SAM的预处理方法
+                    image = sam.preprocess(image)
+                    
+                    # 获取图像特征
+                    image_embedding = sam.image_encoder(image)
+                    
+                    # 生成提示点
+                    h, w = image.shape[-2:]
+                    point = torch.tensor([[[w//2, h//2]]], device=device)
+                    point_label = torch.ones(1, 1, device=device)
+                    
+                    # 生成掩膜预测
+                    sparse_embedding, dense_embedding = sam.prompt_encoder(
+                        points=(point, point_label),
+                        boxes=None,
+                        masks=None,
+                    )
+                    
+                    # 预测掩膜
+                    mask_prediction, _ = sam.mask_decoder(
+                        image_embeddings=image_embedding,
+                        image_pe=sam.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=sparse_embedding,
+                        dense_prompt_embeddings=dense_embedding,
+                        multimask_output=False,
+                    )
+                    
+                    # 将预测掩码上采样到原始图像尺寸
+                    mask_prediction = sam.postprocess_masks(
+                        mask_prediction,
+                        input_size=image.shape[-2:],
+                        original_size=image.shape[-2:]
+                    )
+                    
+                    # 计算评估指标
+                    pred_mask = (torch.sigmoid(mask_prediction) > 0.5).float()
+                    curr_dice = calculate_dice(pred_mask, mask.unsqueeze(1)).item()
+                    
+                    # 计算HD95和特异性
+                    pred_np = pred_mask.squeeze().cpu().numpy()
+                    mask_np = mask.squeeze().cpu().numpy()
+                    curr_hd95 = calculate_hausdorff(pred_np, mask_np)
+                    curr_spec = calculate_specificity(pred_np, mask_np)
+                    
+                    # 累加指标
+                    batch_dice += curr_dice
+                    batch_hd95 += curr_hd95
+                    batch_spec += curr_spec
+                
+                # 累加批次指标
+                test_dice += batch_dice
+                test_hd95 += batch_hd95
+                test_spec += batch_spec
+                test_samples += batch_size
+            
+            # 计算平均指标
+            test_dice /= test_samples
+            test_hd95 /= test_samples
+            test_spec /= test_samples
+        
+        logger.info(f"测试结果 - Dice: {test_dice:.4f}, HD95: {test_hd95:.4f}, Spec: {test_spec:.4f}")
     
     # 关闭 TensorBoard writer
     writer.close()

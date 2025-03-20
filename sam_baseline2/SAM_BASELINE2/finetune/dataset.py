@@ -4,6 +4,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+import warnings
+import albumentations as A
+
+# 在文件开头添加以下代码来忽略特定警告
+warnings.filterwarnings("ignore", message="Error fetching version info")
 
 class BUSIDataset(Dataset):
     def __init__(self, data_root, transform=None, split='train'):
@@ -65,9 +70,12 @@ class BUSIDataset(Dataset):
             image = augmented['image']
             mask = augmented['mask']
         
-        # 转为 PyTorch 张量
-        image = torch.from_numpy(np.transpose(image, (2, 0, 1))).float() / 255.0
-        mask = torch.from_numpy(mask).long()
+        # 检查是否已经是张量
+        if not isinstance(image, torch.Tensor):
+            # 转为 PyTorch 张量
+            image = torch.from_numpy(np.transpose(image, (2, 0, 1))).float() / 255.0
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.from_numpy(mask).long()
         
         # 标签: 0为良性, 1为恶性
         label = 1 if category == 'malignant' else 0
@@ -81,23 +89,20 @@ class BUSIDataset(Dataset):
 
 def build_data_loader(data_root, batch_size=4, num_workers=4):
     """构建数据加载器"""
-    # 可以使用 albumentations 库添加数据增强
-    try:
-        import albumentations as A
-        transform = A.Compose([
-            A.Resize(1024, 1024),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=0.5),
-            A.RandomBrightnessContrast(p=0.2),
-        ])
-    except ImportError:
-        transform = None
-        print("请安装 albumentations 库以使用数据增强")
+    from albumentations.pytorch import ToTensorV2
+
+    transform = A.Compose([
+        A.Resize(1024, 1024),  # 调整大小到 1024x1024
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        ToTensorV2()  # 确保转换为 PyTorch 张量
+    ])
     
     train_dataset = BUSIDataset(data_root, transform=transform, split='train')
-    val_dataset = BUSIDataset(data_root, transform=None, split='val')
-    test_dataset = BUSIDataset(data_root, transform=None, split='test')
+    val_dataset = BUSIDataset(data_root, transform=transform, split='val')
+    test_dataset = BUSIDataset(data_root, transform=transform, split='test')
     
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
