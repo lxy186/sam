@@ -26,16 +26,34 @@ from SAM_BASELINE2.finetune.dataset import build_data_loader
 from SAM_BASELINE2.finetune.utils import calculate_dice, compute_hd95 as calculate_hausdorff, calculate_specificity
 from SAM_BASELINE2.modules.hf_module import add_hf_module
 
+# 添加模型配置类
+class ModelConfig:
+    def __init__(self, embed_dim, num_blocks, mlp_ratio=4):
+        self.embed_dim = embed_dim  # 嵌入维度
+        self.num_blocks = num_blocks  # 块数
+        self.mlp_dim = embed_dim * mlp_ratio  # MLP维度
+        self.qkv_dim = embed_dim * 3  # QKV维度
+        self.rel_pos_dim = 64  # 相对位置编码维度
 
+# 定义不同模型类型的配置
+MODEL_CONFIGS = {
+    'vit_b': ModelConfig(embed_dim=768, num_blocks=12),  # ViT-B配置
+    'vit_l': ModelConfig(embed_dim=1024, num_blocks=24),  # ViT-L配置
+    'vit_h': ModelConfig(embed_dim=1280, num_blocks=32),  # ViT-H配置
+}
 
 def get_args_parser():
     parser = argparse.ArgumentParser('SAM 微调', add_help=False)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--lr', type=float, default=1e-5, help='学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--data_path', default='./Dataset_BUSI_with_GT', type=str)
-    parser.add_argument('--checkpoint', default='./checkpoint/sam_vit_l_0b3195.pth', type=str)
+    parser.add_argument('--checkpoint', type=str, required=True,
+                      help='模型检查点路径。请确保与选择的model_type匹配：\n'
+                           'vit_b: sam_vit_b_01ec64.pth\n'
+                           'vit_l: sam_vit_l_0b3195.pth\n'
+                           'vit_h: sam_vit_h_4b8939.pth')
     parser.add_argument('--output_dir', default='./output', type=str)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--seed', default=42, type=int)
@@ -80,9 +98,37 @@ def main(args):
     logger.info(f"验证集大小: {len(val_loader.dataset)}")
     logger.info(f"测试集大小: {len(test_loader.dataset)}")
     
+    # 获取对应模型类型的配置
+    model_config = MODEL_CONFIGS.get(args.model_type)
+    if not model_config:
+        raise ValueError(f"不支持的模型类型: {args.model_type}")
+    
+    # 处理检查点路径
+    if not os.path.isfile(args.checkpoint):
+        # 尝试在项目根目录下的 checkpoint 目录查找
+        checkpoint_dir = os.path.join(project_root, 'checkpoint')
+        checkpoint_path = os.path.join(checkpoint_dir, os.path.basename(args.checkpoint))
+        if os.path.isfile(checkpoint_path):
+            args.checkpoint = checkpoint_path
+            logger.info(f"找到检查点文件: {checkpoint_path}")
+        else:
+            raise FileNotFoundError(f"找不到检查点文件: {args.checkpoint}\n"
+                                  f"也不在默认路径: {checkpoint_path}")
+    
     # 加载模型
     logger.info(f"加载 SAM 模型 {args.model_type}...")
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
+    
+    # 验证模型结构是否符合预期
+    image_encoder = sam.image_encoder
+    actual_embed_dim = image_encoder.patch_embed.proj.out_channels
+    actual_num_blocks = len(image_encoder.blocks)
+    
+    if actual_embed_dim != model_config.embed_dim or actual_num_blocks != model_config.num_blocks:
+        logger.error(f"模型结构不匹配!")
+        logger.error(f"期望配置: embed_dim={model_config.embed_dim}, num_blocks={model_config.num_blocks}")
+        logger.error(f"实际配置: embed_dim={actual_embed_dim}, num_blocks={actual_num_blocks}")
+        raise ValueError("模型结构与所选类型不匹配")
     
     # 添加HF模块
     if args.use_hf:
